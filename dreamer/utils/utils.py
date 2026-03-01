@@ -73,11 +73,33 @@ def create_normal_dist(
         mean = mean_scale * mean
         std = F.softplus(std + init_std) + min_std
     else:
-        mean = x
+        mean = x  # the mean is set to x with std = 1
     dist = torch.distributions.Normal(mean, std)
     if event_shape:
-        dist = torch.distributions.Independent(dist, event_shape)
+        dist = torch.distributions.Independent(dist, event_shape) # this is going to be 1 by 64 by 64 = 4096. floor(log_prob(image with 4096)) = 4096 * 0.5 * ln(sqrt(2pi))
     return dist
+
+# FROM PYTORCH LOG PROB: scale = 1 so we do var=1^2, log_scale = ln1 = 0, and then ln(sqrt(2 * pi)) = 1/2 * ln(2pi), which is <1 but super close to ln1
+# the output will be something like summing the pixel x_i minus the mean sqaured (basically mse) + 4096 (64^2 from image size) * 1/2 * ln(2pi) ~ mse + ~4000 (the constant term added is super high) 
+# def log_prob(self, value):
+#         if self._validate_args:
+#             self._validate_sample(value)
+#         # compute the variance
+#         # pyrefly: ignore [unsupported-operation]
+#         var = self.scale**2
+#         log_scale = (
+#             math.log(self.scale)
+#             if isinstance(self.scale, _Number)
+#             else self.scale.log()
+#         )
+#         return (
+#             -((value - self.loc) ** 2) / (2 * var)
+#             - log_scale
+#             - math.log(math.sqrt(2 * math.pi))
+#         )
+
+
+
 
 
 def compute_lambda_values(rewards, values, continues, horizon_length, device, lambda_):

@@ -58,6 +58,8 @@ class ReplayBuffer(object):
         observation = torch.as_tensor(
             self.observation[sample_index], device=self.device
         ).float()
+        
+
         next_observation = torch.as_tensor(
             self.next_observation[sample_index], device=self.device
         ).float()

@@ -57,5 +57,9 @@ class Decoder(nn.Module):
         x = horizontal_forward(
             self.network, posterior, deterministic, output_shape=self.observation_shape
         )
-        dist = create_normal_dist(x, std=1, event_shape=len(self.observation_shape))
+        dist = create_normal_dist(x, std=1, event_shape=len(self.observation_shape)) # normal dist has std=1 hardcoded + shape = 1x64x64 (len(obs_shape) = 3)
+        
         return dist
+
+
+
