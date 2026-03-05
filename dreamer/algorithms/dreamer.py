@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from pathlib import Path
+from tqdm import tqdm
 
 from dreamer.modules.model import RSSM# , RewardModel, ContinueModel
 from dreamer.modules.encoder import Encoder
@@ -89,7 +91,39 @@ class Dreamer:
         self.decoder.eval()
         self.rssm.eval()
 
-    def train(self, env=None, viz_interval=50, val_interval=50):
+    def save_checkpoint(self, checkpoint_dir, epoch, total_steps):
+        """Save model checkpoint (encoder, decoder, rssm)."""
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        checkpoint = {
+            "epoch": epoch,
+            "total_steps": total_steps,
+            "encoder": self.encoder.state_dict(),
+            "decoder": self.decoder.state_dict(),
+            "rssm": self.rssm.state_dict(),
+        }
+        
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        
+        latest_path = checkpoint_dir / "checkpoint_latest.pt"
+        torch.save(checkpoint, latest_path)
+        
+        print(f"  Saved checkpoint: {checkpoint_path.name}")
+
+    def load_checkpoint(self, checkpoint_path):
+        """Load model checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.encoder.load_state_dict(checkpoint["encoder"])
+        self.decoder.load_state_dict(checkpoint["decoder"])
+        self.rssm.load_state_dict(checkpoint["rssm"])
+        
+        return checkpoint.get("epoch", 0), checkpoint.get("total_steps", 0)
+
+    def train(self, env=None, viz_interval=50):
+        """Legacy iteration-based training (for backwards compatibility)."""
         total_steps = 0
         for iteration in range(self.config.train_iterations):
             self._set_train_mode()
@@ -113,31 +147,99 @@ class Dreamer:
             print(f"Iter {iteration}/{self.config.train_iterations}, "
                   f"recon={avg_losses['reconstruction_loss']:.4f}, kl={avg_losses['kl_loss']:.4f}", flush=True)
             
-            # Compute validation loss and visualizations
-            if self.val_buffer is not None and iteration % val_interval == 0:
+            # Validation and visualizations at viz_interval
+            if iteration % viz_interval == 0:
                 self._set_eval_mode()
-                val_losses = self._compute_validation_loss()
+                
                 if self.logger is not None:
-                    # Log both train and val losses at val_interval (using averaged train losses)
                     self.logger.log_scalar("loss/reconstruction", avg_losses["reconstruction_loss"], total_steps)
                     self.logger.log_scalar("loss/kl", avg_losses["kl_loss"], total_steps)
                     self.logger.log_scalar("loss/total", avg_losses["model_loss"], total_steps)
-                    self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], total_steps)
-                    self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], total_steps)
-                    self.logger.log_scalar("val_loss/total", val_losses["model_loss"], total_steps)
-                print(f"  [Val] recon={val_losses['reconstruction_loss']:.4f}, kl={val_losses['kl_loss']:.4f}", flush=True)
                 
-                # Log validation visualizations
+                if self.val_buffer is not None:
+                    val_losses = self._compute_validation_loss()
+                    if self.logger is not None:
+                        self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], total_steps)
+                        self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], total_steps)
+                        self.logger.log_scalar("val_loss/total", val_losses["model_loss"], total_steps)
+                    print(f"  [Val] recon={val_losses['reconstruction_loss']:.4f}, kl={val_losses['kl_loss']:.4f}", flush=True)
+                
+                # Visualizations for both train and val
                 if self.logger is not None:
-                    val_data = self.val_buffer.sample(
-                        self.config.batch_size, self.config.batch_length
-                    )
-                    self._log_visualizations(val_data, iteration, prefix="val_")
+                    self._log_visualizations(data, iteration, prefix="train_")
+                    if self.val_buffer is not None:
+                        val_data = self.val_buffer.sample(
+                            self.config.batch_size, self.config.batch_length
+                        )
+                        self._log_visualizations(val_data, iteration, prefix="val_")
+                    self.logger.save_loss_curves()
+                    self.save_checkpoint(self.logger.log_dir / "checkpoints", iteration, total_steps)
+
+    def train_epochs(self, train_loader, val_loader=None, num_epochs=100,
+                     viz_interval=1):
+        """
+        Epoch-based training using DataLoaders.
+        
+        Args:
+            train_loader: DataLoader for training data
+            val_loader: Optional DataLoader for validation data
+            num_epochs: Number of epochs to train
+            viz_interval: Epochs between validation and visualizations (both train and val)
+        """
+        total_steps = 0
+        
+        for epoch in range(num_epochs):
+            self._set_train_mode()
             
-            if self.logger is not None and iteration % viz_interval == 0:
+            # Training epoch
+            epoch_losses = {"reconstruction_loss": 0.0, "kl_loss": 0.0, "model_loss": 0.0}
+            num_batches = 0
+            
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", leave=False)
+            for batch_idx, data in enumerate(pbar):
+                losses = self.dynamic_learning(data)
+                for k in epoch_losses:
+                    epoch_losses[k] += losses[k]
+                num_batches += 1
+                total_steps += 1
+                pbar.set_postfix(recon=f"{losses['reconstruction_loss']:.4f}", kl=f"{losses['kl_loss']:.4f}")
+            
+            # Average over epoch
+            avg_losses = {k: v / num_batches for k, v in epoch_losses.items()}
+            
+            print(f"Epoch {epoch + 1}/{num_epochs} ({num_batches} batches), "
+                  f"recon={avg_losses['reconstruction_loss']:.4f}, kl={avg_losses['kl_loss']:.4f}", flush=True)
+            
+            # Log training losses every epoch
+            if self.logger is not None:
+                self.logger.log_scalar("loss/reconstruction", avg_losses["reconstruction_loss"], total_steps)
+                self.logger.log_scalar("loss/kl", avg_losses["kl_loss"], total_steps)
+                self.logger.log_scalar("loss/total", avg_losses["model_loss"], total_steps)
+            
+            # Validation and visualizations (both train and val) at viz_interval
+            if (epoch + 1) % viz_interval == 0:
                 self._set_eval_mode()
-                self._log_visualizations(data, iteration, prefix="train_")
-                self.logger.save_loss_curves()
+                
+                # Validation loss
+                if val_loader is not None:
+                    val_losses = self._compute_validation_loss_epoch(val_loader)
+                    
+                    if self.logger is not None:
+                        self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], total_steps)
+                        self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], total_steps)
+                        self.logger.log_scalar("val_loss/total", val_losses["model_loss"], total_steps)
+                    
+                    print(f"  [Val] recon={val_losses['reconstruction_loss']:.4f}, "
+                          f"kl={val_losses['kl_loss']:.4f}", flush=True)
+                
+                # Visualizations for both train and val
+                if self.logger is not None:
+                    self._log_visualizations(data, epoch, prefix="train_")
+                    if val_loader is not None:
+                        val_data = next(iter(val_loader))
+                        self._log_visualizations(val_data, epoch, prefix="val_")
+                    self.logger.save_loss_curves()
+                    self.save_checkpoint(self.logger.log_dir / "checkpoints", epoch, total_steps)
 
     # def evaluate(self, env):
     #     self.environment_interaction(env, self.config.num_evaluate, train=False)
@@ -259,7 +361,7 @@ class Dreamer:
 
     @torch.no_grad()
     def _compute_validation_loss(self, num_batches: int = 5):
-        """Compute validation loss over multiple batches without gradients."""
+        """Compute validation loss over multiple batches without gradients (legacy sample-based)."""
         total_recon = 0.0
         total_kl = 0.0
         total_model = 0.0
@@ -269,69 +371,99 @@ class Dreamer:
                 self.config.batch_size, self.config.batch_length
             )
             
-            prior, deterministic = self.rssm.recurrent_model_input_init(data.action.shape[0])
-            embedded_observation = self.encoder(data.observation, data.state)
-            
-            prior_means = []
-            prior_stds = []
-            posterior_means = []
-            posterior_stds = []
-            posteriors = []
-            deterministics = []
-            
-            for t in range(1, data.observation.shape[1]):
-                deterministic = self.rssm.recurrent_model(
-                    prior, data.action[:, t - 1], deterministic
-                )
-                prior_dist, prior = self.rssm.transition_model(deterministic)
-                posterior_dist, posterior = self.rssm.representation_model(
-                    embedded_observation[:, t], deterministic
-                )
-                
-                posteriors.append(posterior)
-                deterministics.append(deterministic)
-                prior_means.append(prior_dist.mean)
-                prior_stds.append(prior_dist.scale)
-                posterior_means.append(posterior_dist.mean)
-                posterior_stds.append(posterior_dist.scale)
-                
-                prior = posterior
-            
-            posteriors = torch.stack(posteriors, dim=1)
-            deterministics = torch.stack(deterministics, dim=1)
-            
-            reconstructed_observation_dist = self.decoder(posteriors, deterministics)
-            
-            prior_dist = create_normal_dist(
-                torch.stack(prior_means, dim=1),
-                torch.stack(prior_stds, dim=1),
-                event_shape=1,
-            )
-            posterior_dist = create_normal_dist(
-                torch.stack(posterior_means, dim=1),
-                torch.stack(posterior_stds, dim=1),
-                event_shape=1,
-            )
-            
-            reconstruction_loss = -reconstructed_observation_dist.log_prob(
-                data.observation[:, 1:].view(reconstructed_observation_dist.mean.shape)
-            ).mean()
-            
-            kl_loss = torch.distributions.kl.kl_divergence(posterior_dist, prior_dist)
-            kl_loss = kl_loss.sum(dim=-1).mean()
-            kl_loss = torch.clamp(kl_loss, min=self.config.free_nats)
-            
-            model_loss = self.config.kl_divergence_scale * kl_loss + reconstruction_loss
-            
-            total_recon += reconstruction_loss.item()
-            total_kl += kl_loss.item()
-            total_model += model_loss.item()
+            recon, kl, model = self._compute_losses_for_batch(data)
+            total_recon += recon
+            total_kl += kl
+            total_model += model
         
         return {
             "reconstruction_loss": total_recon / num_batches,
             "kl_loss": total_kl / num_batches,
             "model_loss": total_model / num_batches,
         }
+    
+    @torch.no_grad()
+    def _compute_validation_loss_epoch(self, val_loader, max_batches: int = None):
+        """Compute validation loss over DataLoader without gradients."""
+        total_recon = 0.0
+        total_kl = 0.0
+        total_model = 0.0
+        num_batches = 0
+        
+        for batch_idx, data in enumerate(val_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            
+            recon, kl, model = self._compute_losses_for_batch(data)
+            total_recon += recon
+            total_kl += kl
+            total_model += model
+            num_batches += 1
+        
+        return {
+            "reconstruction_loss": total_recon / num_batches,
+            "kl_loss": total_kl / num_batches,
+            "model_loss": total_model / num_batches,
+        }
+    
+    @torch.no_grad()
+    def _compute_losses_for_batch(self, data):
+        """Compute losses for a single batch (shared by validation methods)."""
+        prior, deterministic = self.rssm.recurrent_model_input_init(data.action.shape[0])
+        embedded_observation = self.encoder(data.observation, data.state)
+        
+        prior_means = []
+        prior_stds = []
+        posterior_means = []
+        posterior_stds = []
+        posteriors = []
+        deterministics = []
+        
+        for t in range(1, data.observation.shape[1]):
+            deterministic = self.rssm.recurrent_model(
+                prior, data.action[:, t - 1], deterministic
+            )
+            prior_dist, prior = self.rssm.transition_model(deterministic)
+            posterior_dist, posterior = self.rssm.representation_model(
+                embedded_observation[:, t], deterministic
+            )
+            
+            posteriors.append(posterior)
+            deterministics.append(deterministic)
+            prior_means.append(prior_dist.mean)
+            prior_stds.append(prior_dist.scale)
+            posterior_means.append(posterior_dist.mean)
+            posterior_stds.append(posterior_dist.scale)
+            
+            prior = posterior
+        
+        posteriors = torch.stack(posteriors, dim=1)
+        deterministics = torch.stack(deterministics, dim=1)
+        
+        reconstructed_observation_dist = self.decoder(posteriors, deterministics)
+        
+        prior_dist = create_normal_dist(
+            torch.stack(prior_means, dim=1),
+            torch.stack(prior_stds, dim=1),
+            event_shape=1,
+        )
+        posterior_dist = create_normal_dist(
+            torch.stack(posterior_means, dim=1),
+            torch.stack(posterior_stds, dim=1),
+            event_shape=1,
+        )
+        
+        reconstruction_loss = -reconstructed_observation_dist.log_prob(
+            data.observation[:, 1:].view(reconstructed_observation_dist.mean.shape)
+        ).mean()
+        
+        kl_loss = torch.distributions.kl.kl_divergence(posterior_dist, prior_dist)
+        kl_loss = torch.clamp(kl_loss, min=self.config.free_nats)
+        kl_loss = kl_loss.sum(dim=-1).mean()
+        
+        model_loss = self.config.kl_divergence_scale * kl_loss + reconstruction_loss
+        
+        return reconstruction_loss.item(), kl_loss.item(), model_loss.item()
 
     @torch.no_grad()
     def predict_next_state(self, observation, state, action, prev_state=None):
