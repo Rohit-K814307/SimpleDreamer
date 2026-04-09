@@ -1,3 +1,9 @@
+import collections
+import collections.abc
+for type_name in collections.abc.__all__:
+    setattr(collections, type_name, getattr(collections.abc, type_name))
+from attrdict import AttrDict
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -80,6 +86,7 @@ class Dreamer:
 
         self.logger = logger
         self.num_total_episode = 0
+        self._total_steps = 0
 
     def _set_train_mode(self):
         self.encoder.train()
@@ -159,9 +166,9 @@ class Dreamer:
                 if self.val_buffer is not None:
                     val_losses = self._compute_validation_loss()
                     if self.logger is not None:
-                        self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], total_steps)
-                        self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], total_steps)
-                        self.logger.log_scalar("val_loss/total", val_losses["model_loss"], total_steps)
+                        self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], self._total_steps)
+                        self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], self._total_steps)
+                        self.logger.log_scalar("val_loss/total", val_losses["model_loss"], self._total_steps)
                     print(f"  [Val] recon={val_losses['reconstruction_loss']:.4f}, kl={val_losses['kl_loss']:.4f}", flush=True)
                 
                 # Visualizations for both train and val
@@ -186,35 +193,43 @@ class Dreamer:
             num_epochs: Number of epochs to train
             viz_interval: Epochs between validation and visualizations (both train and val)
         """
-        total_steps = 0
-        
         for epoch in range(num_epochs):
             self._set_train_mode()
-            
+
             # Training epoch
             epoch_losses = {"reconstruction_loss": 0.0, "kl_loss": 0.0, "model_loss": 0.0}
             num_batches = 0
-            
+            last_kl_scale = 0.0
+
             pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", leave=False)
             for batch_idx, data in enumerate(pbar):
+                data = AttrDict({k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
+                                 for k, v in data.items()})
                 losses = self.dynamic_learning(data)
                 for k in epoch_losses:
                     epoch_losses[k] += losses[k]
+                last_kl_scale = losses["kl_scale"]
                 num_batches += 1
-                total_steps += 1
-                pbar.set_postfix(recon=f"{losses['reconstruction_loss']:.4f}", kl=f"{losses['kl_loss']:.4f}")
-            
+                self._total_steps += 1
+                pbar.set_postfix(
+                    recon=f"{losses['reconstruction_loss']:.4f}",
+                    kl=f"{losses['kl_loss']:.4f}",
+                    kl_w=f"{last_kl_scale:.3f}",
+                )
+
             # Average over epoch
             avg_losses = {k: v / num_batches for k, v in epoch_losses.items()}
-            
+
             print(f"Epoch {epoch + 1}/{num_epochs} ({num_batches} batches), "
-                  f"recon={avg_losses['reconstruction_loss']:.4f}, kl={avg_losses['kl_loss']:.4f}", flush=True)
-            
+                  f"recon={avg_losses['reconstruction_loss']:.4f}, kl={avg_losses['kl_loss']:.4f}, "
+                  f"kl_w={last_kl_scale:.3f}", flush=True)
+
             # Log training losses every epoch
             if self.logger is not None:
-                self.logger.log_scalar("loss/reconstruction", avg_losses["reconstruction_loss"], total_steps)
-                self.logger.log_scalar("loss/kl", avg_losses["kl_loss"], total_steps)
-                self.logger.log_scalar("loss/total", avg_losses["model_loss"], total_steps)
+                self.logger.log_scalar("loss/reconstruction", avg_losses["reconstruction_loss"], self._total_steps)
+                self.logger.log_scalar("loss/kl", avg_losses["kl_loss"], self._total_steps)
+                self.logger.log_scalar("loss/total", avg_losses["model_loss"], self._total_steps)
+                self.logger.log_scalar("kl_scale", last_kl_scale, self._total_steps)
             
             # Validation and visualizations (both train and val) at viz_interval
             if (epoch + 1) % viz_interval == 0:
@@ -225,9 +240,9 @@ class Dreamer:
                     val_losses = self._compute_validation_loss_epoch(val_loader)
                     
                     if self.logger is not None:
-                        self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], total_steps)
-                        self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], total_steps)
-                        self.logger.log_scalar("val_loss/total", val_losses["model_loss"], total_steps)
+                        self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], self._total_steps)
+                        self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], self._total_steps)
+                        self.logger.log_scalar("val_loss/total", val_losses["model_loss"], self._total_steps)
                     
                     print(f"  [Val] recon={val_losses['reconstruction_loss']:.4f}, "
                           f"kl={val_losses['kl_loss']:.4f}", flush=True)
@@ -237,9 +252,11 @@ class Dreamer:
                     self._log_visualizations(data, epoch, prefix="train_")
                     if val_loader is not None:
                         val_data = next(iter(val_loader))
+                        val_data = AttrDict({k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
+                                            for k, v in val_data.items()})
                         self._log_visualizations(val_data, epoch, prefix="val_")
                     self.logger.save_loss_curves()
-                    self.save_checkpoint(self.logger.log_dir / "checkpoints", epoch, total_steps)
+                    self.save_checkpoint(self.logger.log_dir / "checkpoints", epoch, self._total_steps)
 
     # def evaluate(self, env):
     #     self.environment_interaction(env, self.config.num_evaluate, train=False)
@@ -297,11 +314,18 @@ class Dreamer:
             "posterior_stds": torch.stack(posterior_stds, dim=1),
         }
         
-        losses = self._model_update(data, posterior_info)
+        losses = self._model_update(data, posterior_info, total_steps=self._total_steps)
 
         return losses
 
-    def _model_update(self, data, posterior_info):
+    def _kl_scale(self, total_steps):
+        """Linear warmup from 0 → kl_divergence_scale over kl_warmup_steps."""
+        warmup = getattr(self.config, "kl_warmup_steps", 0)
+        if warmup <= 0:
+            return self.config.kl_divergence_scale
+        return self.config.kl_divergence_scale * min(1.0, total_steps / warmup)
+
+    def _model_update(self, data, posterior_info, total_steps=0):
         reconstructed_observation_dist = self.decoder(
             posterior_info["posteriors"], posterior_info["deterministics"]
         )
@@ -340,7 +364,8 @@ class Dreamer:
         kl_loss = torch.clamp(kl_loss, min=self.config.free_nats)
         kl_loss = kl_loss.sum(dim=-1).mean()
 
-        model_loss = self.config.kl_divergence_scale * kl_loss + reconstruction_loss
+        kl_scale = self._kl_scale(total_steps)
+        model_loss = kl_scale * kl_loss + reconstruction_loss
 
         # import pdb; pdb.set_trace()
 
@@ -357,6 +382,7 @@ class Dreamer:
             "reconstruction_loss": reconstruction_loss.item(),
             "kl_loss": kl_loss.item(),
             "model_loss": model_loss.item(),
+            "kl_scale": kl_scale,
         }
 
     @torch.no_grad()
@@ -393,7 +419,9 @@ class Dreamer:
         for batch_idx, data in enumerate(val_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
-            
+
+            data = AttrDict({k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
+                             for k, v in data.items()})
             recon, kl, model = self._compute_losses_for_batch(data)
             total_recon += recon
             total_kl += kl
