@@ -1,9 +1,11 @@
+import torch
 import torch.nn as nn
 
 from dreamer.utils.utils import (
     initialize_weights,
     horizontal_forward,
     create_normal_dist,
+    build_network,
 )
 
 
@@ -53,13 +55,32 @@ class Decoder(nn.Module):
         )
         self.network.apply(initialize_weights)
 
+        # Delta prediction head: (posterior + deterministic) → 16-dim delta targets
+        # d_pos_quad(3) + d_vel_quad(3) + d_pos_payload(3) + d_quat(4) + d_vel_payload(3)
+        self.delta_net = build_network(
+            self.deterministic_size + self.stochastic_size,
+            self.config.delta_hidden_size,
+            self.config.delta_num_layers,
+            self.config.activation,
+            16,
+        )
+        self.delta_net.apply(initialize_weights)
+
     def forward(self, posterior, deterministic):
         x = horizontal_forward(
             self.network, posterior, deterministic, output_shape=self.observation_shape
         )
-        dist = create_normal_dist(x, std=1, event_shape=len(self.observation_shape)) # normal dist has std=1 hardcoded + shape = 1x64x64 (len(obs_shape) = 3)
-        
+        dist = torch.distributions.Independent(
+            torch.distributions.Laplace(x, torch.ones_like(x)),
+            len(self.observation_shape),
+        )
         return dist
+
+    def forward_delta(self, posterior, deterministic):
+        x = horizontal_forward(
+            self.delta_net, posterior, deterministic, output_shape=(16,)
+        )
+        return create_normal_dist(x, std=1, event_shape=1)
 
 
 

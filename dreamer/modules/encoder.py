@@ -48,15 +48,17 @@ class Encoder(nn.Module):
         self.network.apply(initialize_weights)
 
         # add the numeric state encodings
+        state_size = self.config.state_size
+        state_embed_size = self.config.state_embed_size
         self.state_net = nn.Sequential(
-            nn.Linear(3, 16),
+            nn.Linear(state_size, state_embed_size * 2),
             nn.ELU(),
-            nn.Linear(16, 8),
+            nn.Linear(state_embed_size * 2, state_embed_size),
             nn.ELU()
         )
         self.state_net.apply(initialize_weights)
 
-        self.projection_net = nn.Linear(1024 + 8, 1024)
+        self.projection_net = nn.Linear(1024 + state_embed_size, 1024)
         self.projection_net.apply(initialize_weights)
 
 
@@ -64,9 +66,9 @@ class Encoder(nn.Module):
         img_embeddings = horizontal_forward(self.network, x, input_shape=self.observation_shape)
         img_embeddings = img_embeddings.reshape(img_embeddings.shape[0], img_embeddings.shape[1], -1)
 
-        state_embeddings = horizontal_forward(self.state_net, x_s, input_shape=(3,))
+        state_embeddings = horizontal_forward(self.state_net, x_s, input_shape=(self.config.state_size,))
 
         x = torch.cat([img_embeddings, state_embeddings], dim=-1)
 
-        return horizontal_forward(self.projection_net, x, input_shape=(1024+8,))
+        return horizontal_forward(self.projection_net, x, input_shape=(1024 + self.config.state_embed_size,))
 

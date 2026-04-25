@@ -72,6 +72,8 @@ class Dreamer:
         self.model_optimizer = torch.optim.Adam(
             self.model_params, lr=self.config.model_learning_rate
         )
+        # LR scheduler — built lazily in train_epochs once num_epochs is known
+        self.lr_scheduler = None
         # self.actor_optimizer = torch.optim.Adam(
         #     self.actor.parameters(), lr=self.config.actor_learning_rate
         # )
@@ -109,6 +111,8 @@ class Dreamer:
             "encoder": self.encoder.state_dict(),
             "decoder": self.decoder.state_dict(),
             "rssm": self.rssm.state_dict(),
+            "optimizer": self.model_optimizer.state_dict(),
+            "lr_scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None,
         }
         
         checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"
@@ -119,14 +123,26 @@ class Dreamer:
         
         print(f"  Saved checkpoint: {checkpoint_path.name}")
 
-    def load_checkpoint(self, checkpoint_path):
-        """Load model checkpoint."""
+    def load_checkpoint(self, checkpoint_path, weights_only=False):
+        """Load model checkpoint.
+
+        Args:
+            checkpoint_path: Path to checkpoint file.
+            weights_only: If True, load only model weights (encoder/decoder/rssm).
+                          Optimizer and scheduler state are skipped — useful when
+                          resuming with a different schedule or after architecture changes.
+        """
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
+
         self.encoder.load_state_dict(checkpoint["encoder"])
         self.decoder.load_state_dict(checkpoint["decoder"])
         self.rssm.load_state_dict(checkpoint["rssm"])
-        
+        if not weights_only:
+            if "optimizer" in checkpoint:
+                self.model_optimizer.load_state_dict(checkpoint["optimizer"])
+            if "lr_scheduler" in checkpoint and checkpoint["lr_scheduler"] is not None and self.lr_scheduler is not None:
+                self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+
         return checkpoint.get("epoch", 0), checkpoint.get("total_steps", 0)
 
     def train(self, env=None, viz_interval=50):
@@ -183,7 +199,7 @@ class Dreamer:
                     self.save_checkpoint(self.logger.log_dir / "checkpoints", iteration, total_steps)
 
     def train_epochs(self, train_loader, val_loader=None, num_epochs=100,
-                     viz_interval=1):
+                     viz_interval=1, start_epoch=0):
         """
         Epoch-based training using DataLoaders.
         
@@ -193,11 +209,38 @@ class Dreamer:
             num_epochs: Number of epochs to train
             viz_interval: Epochs between validation and visualizations (both train and val)
         """
-        for epoch in range(num_epochs):
+        # Build LR scheduler once we know num_epochs.
+        # last_epoch=start_epoch-1 fast-forwards the schedule to the correct
+        # position when resuming mid-run (default -1 = fresh start).
+        sched_type = getattr(self.config, "lr_scheduler", "none")
+        if self.lr_scheduler is None and sched_type != "none":
+            # Always create with last_epoch=-1 so PyTorch sets initial_lr in
+            # the optimizer param groups (required even when resuming mid-run).
+            # Then fast-forward by stepping start_epoch times — pure math, instant.
+            if sched_type == "cosine":
+                self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.model_optimizer,
+                    T_max=num_epochs,
+                    eta_min=getattr(self.config, "lr_min", 6e-5),
+                )
+            elif sched_type == "step":
+                self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+                    self.model_optimizer,
+                    step_size=getattr(self.config, "lr_decay_epochs", 50),
+                    gamma=getattr(self.config, "lr_decay_gamma", 0.5),
+                )
+            for _ in range(start_epoch):
+                self.lr_scheduler.step()
+            current_lr = self.model_optimizer.param_groups[0]["lr"]
+            print(f"LR scheduler: {sched_type}  lr={current_lr:.2e}  (T_max={num_epochs}, start_epoch={start_epoch})", flush=True)
+        elif sched_type == "none":
+            print("LR scheduler: none (fixed LR)", flush=True)
+
+        for epoch in range(start_epoch, num_epochs):
             self._set_train_mode()
 
             # Training epoch
-            epoch_losses = {"reconstruction_loss": 0.0, "kl_loss": 0.0, "model_loss": 0.0}
+            epoch_losses = {"reconstruction_loss": 0.0, "delta_loss": 0.0, "kl_loss": 0.0, "model_loss": 0.0}
             num_batches = 0
             last_kl_scale = 0.0
 
@@ -213,6 +256,7 @@ class Dreamer:
                 self._total_steps += 1
                 pbar.set_postfix(
                     recon=f"{losses['reconstruction_loss']:.4f}",
+                    delta=f"{losses['delta_loss']:.4f}",
                     kl=f"{losses['kl_loss']:.4f}",
                     kl_w=f"{last_kl_scale:.3f}",
                 )
@@ -220,16 +264,24 @@ class Dreamer:
             # Average over epoch
             avg_losses = {k: v / num_batches for k, v in epoch_losses.items()}
 
+            # Step LR scheduler once per epoch (before logging so we log the new LR)
+            current_lr = self.model_optimizer.param_groups[0]["lr"]
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+                current_lr = self.model_optimizer.param_groups[0]["lr"]
+
             print(f"Epoch {epoch + 1}/{num_epochs} ({num_batches} batches), "
-                  f"recon={avg_losses['reconstruction_loss']:.4f}, kl={avg_losses['kl_loss']:.4f}, "
-                  f"kl_w={last_kl_scale:.3f}", flush=True)
+                  f"recon={avg_losses['reconstruction_loss']:.4f}, delta={avg_losses['delta_loss']:.4f}, "
+                  f"kl={avg_losses['kl_loss']:.4f}, kl_w={last_kl_scale:.3f}, lr={current_lr:.2e}", flush=True)
 
             # Log training losses every epoch
             if self.logger is not None:
                 self.logger.log_scalar("loss/reconstruction", avg_losses["reconstruction_loss"], self._total_steps)
+                self.logger.log_scalar("loss/delta", avg_losses["delta_loss"], self._total_steps)
                 self.logger.log_scalar("loss/kl", avg_losses["kl_loss"], self._total_steps)
                 self.logger.log_scalar("loss/total", avg_losses["model_loss"], self._total_steps)
                 self.logger.log_scalar("kl_scale", last_kl_scale, self._total_steps)
+                self.logger.log_scalar("lr", current_lr, self._total_steps)
             
             # Validation and visualizations (both train and val) at viz_interval
             if (epoch + 1) % viz_interval == 0:
@@ -237,21 +289,27 @@ class Dreamer:
                 
                 # Validation loss
                 if val_loader is not None:
-                    val_losses = self._compute_validation_loss_epoch(val_loader)
+                    val_losses = self._compute_validation_loss_epoch(val_loader, max_batches=50)
                     
                     if self.logger is not None:
                         self.logger.log_scalar("val_loss/reconstruction", val_losses["reconstruction_loss"], self._total_steps)
+                        self.logger.log_scalar("val_loss/delta", val_losses["delta_loss"], self._total_steps)
                         self.logger.log_scalar("val_loss/kl", val_losses["kl_loss"], self._total_steps)
                         self.logger.log_scalar("val_loss/total", val_losses["model_loss"], self._total_steps)
-                    
+
                     print(f"  [Val] recon={val_losses['reconstruction_loss']:.4f}, "
+                          f"delta={val_losses['delta_loss']:.4f}, "
                           f"kl={val_losses['kl_loss']:.4f}", flush=True)
                 
                 # Visualizations for both train and val
                 if self.logger is not None:
                     self._log_visualizations(data, epoch, prefix="train_")
-                    if val_loader is not None:
-                        val_data = next(iter(val_loader))
+                    if val_loader is not None and self.val_buffer is not None:
+                        import random
+                        from torch.utils.data import default_collate
+                        indices = random.sample(range(len(self.val_buffer)),
+                                                min(self.config.batch_size, len(self.val_buffer)))
+                        val_data = AttrDict(default_collate([self.val_buffer[i] for i in indices]))
                         val_data = AttrDict({k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
                                             for k, v in val_data.items()})
                         self._log_visualizations(val_data, epoch, prefix="val_")
@@ -360,14 +418,23 @@ class Dreamer:
             data.observation[:, 1:].view(reconstructed_observation_dist.mean.shape)
         ).mean()
 
+        delta_dist = self.decoder.forward_delta(
+            posterior_info["posteriors"], posterior_info["deterministics"]
+        )
+        delta_loss = -delta_dist.log_prob(
+            data.delta[:, 1:].view(delta_dist.mean.shape)
+        ).mean()
+
         kl_loss = torch.distributions.kl.kl_divergence(posterior_dist, prior_dist)
         kl_loss = torch.clamp(kl_loss, min=self.config.free_nats)
         kl_loss = kl_loss.sum(dim=-1).mean()
 
         kl_scale = self._kl_scale(total_steps)
-        model_loss = kl_scale * kl_loss + reconstruction_loss
-
-        # import pdb; pdb.set_trace()
+        model_loss = (
+            kl_scale * kl_loss
+            + reconstruction_loss
+            + self.config.delta_loss_scale * delta_loss
+        )
 
         self.model_optimizer.zero_grad()
         model_loss.backward()
@@ -376,10 +443,11 @@ class Dreamer:
             self.config.clip_grad,
             norm_type=self.config.grad_norm_type,
         )
-        self.model_optimizer.step() 
+        self.model_optimizer.step()
 
         return {
             "reconstruction_loss": reconstruction_loss.item(),
+            "delta_loss": delta_loss.item(),
             "kl_loss": kl_loss.item(),
             "model_loss": model_loss.item(),
             "kl_scale": kl_scale,
@@ -396,12 +464,12 @@ class Dreamer:
             data = self.val_buffer.sample(
                 self.config.batch_size, self.config.batch_length
             )
-            
-            recon, kl, model = self._compute_losses_for_batch(data)
+
+            recon, delta, kl, model = self._compute_losses_for_batch(data)
             total_recon += recon
             total_kl += kl
             total_model += model
-        
+
         return {
             "reconstruction_loss": total_recon / num_batches,
             "kl_loss": total_kl / num_batches,
@@ -412,24 +480,27 @@ class Dreamer:
     def _compute_validation_loss_epoch(self, val_loader, max_batches: int = None):
         """Compute validation loss over DataLoader without gradients."""
         total_recon = 0.0
+        total_delta = 0.0
         total_kl = 0.0
         total_model = 0.0
         num_batches = 0
-        
+
         for batch_idx, data in enumerate(val_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
 
             data = AttrDict({k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
                              for k, v in data.items()})
-            recon, kl, model = self._compute_losses_for_batch(data)
+            recon, delta, kl, model = self._compute_losses_for_batch(data)
             total_recon += recon
+            total_delta += delta
             total_kl += kl
             total_model += model
             num_batches += 1
-        
+
         return {
             "reconstruction_loss": total_recon / num_batches,
+            "delta_loss": total_delta / num_batches,
             "kl_loss": total_kl / num_batches,
             "model_loss": total_model / num_batches,
         }
@@ -484,14 +555,23 @@ class Dreamer:
         reconstruction_loss = -reconstructed_observation_dist.log_prob(
             data.observation[:, 1:].view(reconstructed_observation_dist.mean.shape)
         ).mean()
-        
+
+        delta_dist = self.decoder.forward_delta(posteriors, deterministics)
+        delta_loss = -delta_dist.log_prob(
+            data.delta[:, 1:].view(delta_dist.mean.shape)
+        ).mean()
+
         kl_loss = torch.distributions.kl.kl_divergence(posterior_dist, prior_dist)
         kl_loss = torch.clamp(kl_loss, min=self.config.free_nats)
         kl_loss = kl_loss.sum(dim=-1).mean()
-        
-        model_loss = self.config.kl_divergence_scale * kl_loss + reconstruction_loss
-        
-        return reconstruction_loss.item(), kl_loss.item(), model_loss.item()
+
+        model_loss = (
+            self.config.kl_divergence_scale * kl_loss
+            + reconstruction_loss
+            + self.config.delta_loss_scale * delta_loss
+        )
+
+        return reconstruction_loss.item(), delta_loss.item(), kl_loss.item(), model_loss.item()
 
     @torch.no_grad()
     def predict_next_state(self, observation, state, action, prev_state=None):
@@ -610,8 +690,13 @@ class Dreamer:
         obs = data.observation[:num_samples]
         actions = data.action[:num_samples]
         states = data.state[:num_samples]
-        img_mean = data.img_mean[:num_samples]
-        img_std = data.img_std[:num_samples]
+        gs = getattr(self.buffer, "global_stats", None)
+        if gs is not None:
+            img_mean = torch.tensor([[[[float(gs["img_mean"])]]]]).to(self.device)
+            img_std  = torch.tensor([[[[float(gs["img_std"])]]]]).to(self.device)
+        else:
+            img_mean = torch.zeros(1, 1, 1, 1, device=self.device)
+            img_std  = torch.ones(1, 1, 1, 1, device=self.device) * 255.0
         
         # Reconstruction: all timesteps
         recon_result = self._visualize_reconstruction(obs, states, actions, img_mean, img_std)
