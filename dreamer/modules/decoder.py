@@ -71,7 +71,7 @@ class Decoder(nn.Module):
             self.network, posterior, deterministic, output_shape=self.observation_shape
         )
         dist = torch.distributions.Independent(
-            torch.distributions.Laplace(x, torch.ones_like(x)),
+            torch.distributions.Bernoulli(logits=x),
             len(self.observation_shape),
         )
         return dist

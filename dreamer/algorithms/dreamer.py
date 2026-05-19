@@ -668,19 +668,8 @@ class Dreamer:
         }
 
     def _unnormalize_img(self, img, img_mean, img_std):
-        """Un-normalize image tensor: img * std + mean, then scale to [0, 1].
-        
-        Args:
-            img: tensor of any shape with normalized pixel values
-            img_mean: broadcastable mean tensor (computed on [0, 255] range)
-            img_std: broadcastable std tensor (computed on [0, 255] range)
-        
-        Returns:
-            Tensor in [0, 1] range suitable for display.
-        """
-        # Unnormalize back to [0, 255] range, then scale to [0, 1]
-        img_255 = img * img_std + img_mean
-        return (img_255 / 255.0).clamp(0, 1)
+        # Images are already in [0,1] (normalized by /255 in dataloader)
+        return img.clamp(0, 1)
 
     @torch.no_grad()
     def _log_visualizations(self, data, iteration, num_samples=1, prefix=""):
